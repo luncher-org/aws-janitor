@@ -3,15 +3,15 @@ package action
 import (
 	"context"
 	"fmt"
-	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/eks"
 )
 
 func (a *action) cleanEKSClusters(ctx context.Context, input *CleanupScope) error {
 	client := eks.New(input.Session)
 
-	clustersToDelete := []*string{}
+	clustersToDelete := []*eks.Cluster{}
 	pageFunc := func(page *eks.ListClustersOutput, _ bool) bool {
 		for _, name := range page.Clusters {
 			cluster, err := client.DescribeClusterWithContext(ctx, &eks.DescribeClusterInput{
@@ -22,13 +22,24 @@ func (a *action) cleanEKSClusters(ctx context.Context, input *CleanupScope) erro
 				continue
 			}
 
-			maxAge := cluster.Cluster.CreatedAt.Add(input.TTL)
-
-			if time.Now().Before(maxAge) {
-				LogDebug("eks cluster %s has max age greater than now, skipping cleanup", *name)
+			if _, ok := cluster.Cluster.Tags[input.IgnoreTag]; ok {
+				LogDebug("eks cluster %s has ignore tag, skipping cleanup", *name)
 				continue
 			}
-			clustersToDelete = append(clustersToDelete, name)
+
+			if _, ok := cluster.Cluster.Tags[DeletionTag]; !ok {
+				// NOTE: only mark for future deletion if we're not running in dry-mode
+				if a.commit {
+					LogDebug("eks cluster %s does not have deletion tag, marking for future deletion and skipping cleanup", *name)
+					if err := a.markEKSClusterForFutureDeletion(ctx, *cluster.Cluster.Arn, client); err != nil {
+						LogError("failed to mark cluster %s for future deletion: %s", *cluster.Cluster.Arn, err.Error())
+					}
+				}
+				continue
+			}
+
+			LogDebug("adding eks cluster %s to delete list", *name)
+			clustersToDelete = append(clustersToDelete, cluster.Cluster)
 		}
 
 		return true
@@ -43,18 +54,26 @@ func (a *action) cleanEKSClusters(ctx context.Context, input *CleanupScope) erro
 		return nil
 	}
 
-	for _, clusterName := range clustersToDelete {
+	for _, clusterObj := range clustersToDelete {
 		if !a.commit {
-			LogDebug("skipping deletion of eks cluster %s as running in dry-mode", *clusterName)
+			LogDebug("skipping deletion of eks cluster %s as running in dry-mode", *clusterObj.Name)
 			continue
 		}
 
-		if err := a.deleteEKSCluster(ctx, *clusterName, client); err != nil {
-			LogError("failed to delete cluster %s: %s", *clusterName, err.Error())
+		if err := a.deleteEKSCluster(ctx, *clusterObj.Name, client); err != nil {
+			LogError("failed to delete cluster %s: %s", *clusterObj.Name, err.Error())
 		}
 	}
 
 	return nil
+}
+
+func (a *action) markEKSClusterForFutureDeletion(ctx context.Context, clusterArn string, client *eks.EKS) error {
+	Log("Marking EKS cluster %s for future deletion", clusterArn)
+
+	_, err := client.TagResourceWithContext(ctx, &eks.TagResourceInput{ResourceArn: &clusterArn, Tags: map[string]*string{DeletionTag: aws.String("true")}})
+
+	return err
 }
 
 func (a *action) deleteEKSCluster(ctx context.Context, clusterName string, client *eks.EKS) error {
@@ -62,7 +81,7 @@ func (a *action) deleteEKSCluster(ctx context.Context, clusterName string, clien
 
 	LogDebug("Deleting nodegroups for cluster %s", clusterName)
 
-	listErr := client.ListNodegroupsPagesWithContext(ctx, &eks.ListNodegroupsInput{ClusterName: &clusterName}, func(page *eks.ListNodegroupsOutput, b bool) bool {
+	listErr := client.ListNodegroupsPagesWithContext(ctx, &eks.ListNodegroupsInput{ClusterName: &clusterName}, func(page *eks.ListNodegroupsOutput, _ bool) bool {
 		for _, ngName := range page.Nodegroups {
 			Log("Deleting nodegroup %s in cluster %s", *ngName, clusterName)
 			if _, err := client.DeleteNodegroupWithContext(ctx, &eks.DeleteNodegroupInput{ClusterName: &clusterName, NodegroupName: ngName}); err != nil {
@@ -84,7 +103,7 @@ func (a *action) deleteEKSCluster(ctx context.Context, clusterName string, clien
 		return fmt.Errorf("failed to delete cluster %s: %w", clusterName, err)
 	}
 
-	if err := client.WaitUntilClusterDeletedWithContext(ctx, &eks.DescribeClusterInput{}); err != nil {
+	if err := client.WaitUntilClusterDeletedWithContext(ctx, &eks.DescribeClusterInput{Name: &clusterName}); err != nil {
 		return fmt.Errorf("failed to wait for cluster %s to be delete: %w", clusterName, err)
 	}
 

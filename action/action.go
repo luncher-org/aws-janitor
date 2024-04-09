@@ -9,7 +9,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
+	"github.com/aws/aws-sdk-go/service/cloudformation"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/eks"
+	"github.com/aws/aws-sdk-go/service/elb"
 )
 
 type AwsJanitorAction interface {
@@ -26,17 +29,25 @@ type action struct {
 	commit bool
 }
 
+type Cleaner struct {
+	Service string
+	Run     CleanupFunc
+}
+
 func (a *action) Cleanup(ctx context.Context, input *Input) error {
 
-	//NOTE: ordering matters here!
-	cleanupFuncs := map[string]CleanupFunc{
-		eks.ServiceName:         a.cleanEKSClusters,
-		autoscaling.ServiceName: a.cleanASGs,
+	// use []Cleaner to keep the order
+	cleaners := []Cleaner{
+		{Service: eks.ServiceName, Run: a.cleanEKSClusters},
+		{Service: autoscaling.ServiceName, Run: a.cleanASGs},
+		{Service: elb.ServiceName, Run: a.cleanLoadBalancers},
+		{Service: ec2.ServiceName, Run: a.cleanSecurityGroups},
+		{Service: cloudformation.ServiceName, Run: a.cleanCfStacks},
 	}
 	inputRegions := strings.Split(input.Regions, ",")
 
-	for service, cleanupFunc := range cleanupFuncs {
-		regions := getServiceRegions(service, inputRegions)
+	for _, cleaner := range cleaners {
+		regions := getServiceRegions(cleaner.Service, inputRegions)
 
 		for _, region := range regions {
 			sess, err := session.NewSession(&aws.Config{
@@ -47,14 +58,14 @@ func (a *action) Cleanup(ctx context.Context, input *Input) error {
 			}
 
 			scope := &CleanupScope{
-				TTL:     input.TTL,
-				Session: sess,
-				Commit:  input.Commit,
+				Session:   sess,
+				Commit:    input.Commit,
+				IgnoreTag: input.IgnoreTag,
 			}
 
-			Log("Cleaning up resources for service %s in region %s", service, region)
-			if err := cleanupFunc(ctx, scope); err != nil {
-				return fmt.Errorf("failed running cleanup for service %s: %w", service, err)
+			Log("Cleaning up resources for service %s in region %s", cleaner.Service, region)
+			if err := cleaner.Run(ctx, scope); err != nil {
+				return fmt.Errorf("failed running cleanup for service %s: %w", cleaner.Service, err)
 			}
 		}
 	}
