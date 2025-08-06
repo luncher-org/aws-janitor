@@ -22,9 +22,10 @@ func (a *action) cleanLoadBalancers(ctx context.Context, input *CleanupScope) er
 			var ignore, markedForDeletion bool
 			for _, tagDescription := range tags.TagDescriptions {
 				for _, tag := range tagDescription.Tags {
-					if *tag.Key == input.IgnoreTag {
+					switch *tag.Key {
+					case input.IgnoreTag:
 						ignore = true
-					} else if *tag.Key == DeletionTag {
+					case DeletionTag:
 						markedForDeletion = true
 					}
 				}

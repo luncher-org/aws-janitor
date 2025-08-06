@@ -16,9 +16,10 @@ func (a *action) cleanCfStacks(ctx context.Context, input *CleanupScope) error {
 		for _, stack := range page.Stacks {
 			var ignore, markedForDeletion bool
 			for _, tag := range stack.Tags {
-				if *tag.Key == input.IgnoreTag {
+				switch *tag.Key {
+				case input.IgnoreTag:
 					ignore = true
-				} else if *tag.Key == DeletionTag {
+				case DeletionTag:
 					markedForDeletion = true
 				}
 			}
@@ -29,6 +30,12 @@ func (a *action) cleanCfStacks(ctx context.Context, input *CleanupScope) error {
 			}
 
 			if !markedForDeletion {
+				if !a.canUpdateStack(aws.StringValue(stack.StackStatus)) {
+					LogDebug("cloudformation stack %s is in state %s and cannot be updated, skipping",
+						*stack.StackName, aws.StringValue(stack.StackStatus))
+					continue
+				}
+
 				// NOTE: only mark for future deletion if we're not running in dry-mode
 				if a.commit {
 					LogDebug("cloudformation stack %s does not have deletion tag, marking for future deletion and skipping cleanup", *stack.StackName)
@@ -43,6 +50,10 @@ func (a *action) cleanCfStacks(ctx context.Context, input *CleanupScope) error {
 			case cf.ResourceStatusDeleteComplete,
 				cf.ResourceStatusDeleteInProgress:
 				LogDebug("cloudformation stack %s is already deleted/deleting, skipping cleanup", *stack.StackName)
+				continue
+			case cf.StackStatusDeleteFailed:
+				LogDebug("cloudformation stack %s is in DELETE_FAILED state, adding to delete list", *stack.StackName)
+				stacksToDelete = append(stacksToDelete, stack.StackName)
 				continue
 			}
 
@@ -102,8 +113,27 @@ func (a *action) markCfStackForFutureDeletion(ctx context.Context, stack *cf.Sta
 func (a *action) deleteCfStack(ctx context.Context, stackName string, client *cf.CloudFormation) error {
 	Log("Deleting CloudFormation stack %s", stackName)
 
-	if _, err := client.DeleteStackWithContext(ctx, &cf.DeleteStackInput{StackName: &stackName}); err != nil {
-		return fmt.Errorf("failed to delete cloudformation stack %s: %w", stackName, err)
+	stacks, err := client.DescribeStacksWithContext(ctx, &cf.DescribeStacksInput{StackName: &stackName})
+	if err != nil {
+		return fmt.Errorf("failed to describe cloudformation stack %s: %w", stackName, err)
+	}
+
+	if len(stacks.Stacks) > 0 {
+		stackStatus := aws.StringValue(stacks.Stacks[0].StackStatus)
+		if stackStatus == cf.StackStatusDeleteFailed {
+			Log("Stack %s is in DELETE_FAILED state, attempting to continue deletion", stackName)
+
+			if _, err := client.DeleteStackWithContext(ctx, &cf.DeleteStackInput{
+				StackName:       &stackName,
+				RetainResources: []*string{},
+			}); err != nil {
+				return fmt.Errorf("failed to continue deletion of cloudformation stack %s: %w", stackName, err)
+			}
+		} else {
+			if _, err := client.DeleteStackWithContext(ctx, &cf.DeleteStackInput{StackName: &stackName}); err != nil {
+				return fmt.Errorf("failed to delete cloudformation stack %s: %w", stackName, err)
+			}
+		}
 	}
 
 	if err := client.WaitUntilStackDeleteCompleteWithContext(ctx, &cf.DescribeStacksInput{StackName: &stackName}); err != nil {
@@ -111,4 +141,24 @@ func (a *action) deleteCfStack(ctx context.Context, stackName string, client *cf
 	}
 
 	return nil
+}
+
+func (a *action) canUpdateStack(stackStatus string) bool {
+	nonUpdatableStates := []string{
+		cf.StackStatusCreateInProgress,
+		cf.StackStatusDeleteInProgress,
+		cf.StackStatusDeleteFailed,
+		cf.StackStatusDeleteComplete,
+		cf.StackStatusUpdateInProgress,
+		cf.StackStatusUpdateRollbackInProgress,
+		cf.StackStatusUpdateRollbackCompleteCleanupInProgress,
+		cf.StackStatusReviewInProgress,
+	}
+
+	for _, state := range nonUpdatableStates {
+		if stackStatus == state {
+			return false
+		}
+	}
+	return true
 }

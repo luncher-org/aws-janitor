@@ -43,6 +43,7 @@ func (a *action) Cleanup(ctx context.Context, input *Input) error {
 		{Service: elb.ServiceName, Run: a.cleanLoadBalancers},
 		{Service: ec2.ServiceName, Run: a.cleanSecurityGroups},
 		{Service: cloudformation.ServiceName, Run: a.cleanCfStacks},
+		{Service: ec2.ServiceName, Run: a.cleanVPCs},
 	}
 	inputRegions := strings.Split(input.Regions, ",")
 
