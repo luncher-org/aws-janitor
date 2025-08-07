@@ -3,6 +3,7 @@ package action
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -153,8 +154,59 @@ func (a *action) deleteSecurityGroupRules(ctx context.Context, sgId string, sgIn
 func (a *action) deleteSecurityGroup(ctx context.Context, sgId string, client *ec2.EC2) error {
 	Log("Deleting Security Group %s", sgId)
 
-	if _, err := client.DeleteSecurityGroupWithContext(ctx, &ec2.DeleteSecurityGroupInput{GroupId: &sgId}); err != nil {
-		return fmt.Errorf("failed to delete security group %s: %w", sgId, err)
+	maxRetries := 5
+	retryDelay := 30 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if _, err := client.DeleteSecurityGroupWithContext(ctx, &ec2.DeleteSecurityGroupInput{GroupId: &sgId}); err != nil {
+			if attempt < maxRetries && a.isDependencyViolation(err) {
+				LogDebug("Security group %s has dependencies, retrying in %v (attempt %d/%d)", sgId, retryDelay, attempt, maxRetries)
+
+				if err := a.handleSecurityGroupDependencies(ctx, sgId, client); err != nil {
+					LogDebug("Failed to handle dependencies for security group %s: %v", sgId, err)
+				}
+
+				time.Sleep(retryDelay)
+				continue
+			}
+			return fmt.Errorf("failed to delete security group %s: %w", sgId, err)
+		}
+		break
+	}
+
+	return nil
+}
+
+func (a *action) isDependencyViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "DependencyViolation") ||
+		strings.Contains(errStr, "has a dependent object")
+}
+
+func (a *action) handleSecurityGroupDependencies(ctx context.Context, sgId string, client *ec2.EC2) error {
+	eniResp, err := client.DescribeNetworkInterfacesWithContext(ctx, &ec2.DescribeNetworkInterfacesInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("group-id"),
+				Values: []*string{aws.String(sgId)},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to describe network interfaces for sg %s: %w", sgId, err)
+	}
+
+	for _, eni := range eniResp.NetworkInterfaces {
+		LogDebug("Security group %s is used by network interface %s (status: %s)",
+			sgId, aws.StringValue(eni.NetworkInterfaceId), aws.StringValue(eni.Status))
+
+		if aws.StringValue(eni.Status) == "available" {
+			LogDebug("Network interface %s is available but not being deleted automatically for safety",
+				aws.StringValue(eni.NetworkInterfaceId))
+		}
 	}
 
 	return nil

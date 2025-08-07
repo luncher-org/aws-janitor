@@ -16,9 +16,10 @@ func (a *action) cleanASGs(ctx context.Context, input *CleanupScope) error {
 		for _, asg := range page.AutoScalingGroups {
 			var ignore, markedForDeletion bool
 			for _, tag := range asg.Tags {
-				if *tag.Key == input.IgnoreTag {
+				switch *tag.Key {
+				case input.IgnoreTag:
 					ignore = true
-				} else if *tag.Key == DeletionTag {
+				case DeletionTag:
 					markedForDeletion = true
 				}
 			}
