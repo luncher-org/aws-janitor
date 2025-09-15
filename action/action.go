@@ -41,6 +41,8 @@ func (a *action) Cleanup(ctx context.Context, input *Input) error {
 		{Service: eks.ServiceName, Run: a.cleanEKSClusters},
 		{Service: autoscaling.ServiceName, Run: a.cleanASGs},
 		{Service: elb.ServiceName, Run: a.cleanLoadBalancers},
+		{Service: elb.ServiceName, Run: a.cleanLoadBalancersV2},
+		{Service: ec2.ServiceName, Run: a.cleanNetworkInterfaces},
 		{Service: ec2.ServiceName, Run: a.cleanSecurityGroups},
 		{Service: cloudformation.ServiceName, Run: a.cleanCfStacks},
 		{Service: ec2.ServiceName, Run: a.cleanVPCs},

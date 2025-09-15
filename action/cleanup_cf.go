@@ -14,9 +14,14 @@ func (a *action) cleanCfStacks(ctx context.Context, input *CleanupScope) error {
 	stacksToDelete := []*string{}
 	pageFunc := func(page *cf.DescribeStacksOutput, _ bool) bool {
 		for _, stack := range page.Stacks {
+			if aws.StringValue(stack.StackName) == "cluster-api-provider-aws-sigs-k8s-io" {
+				LogDebug("cloudformation stack %s is hardcoded to be skipped, skipping cleanup", aws.StringValue(stack.StackName))
+				continue
+			}
+
 			var ignore, markedForDeletion bool
 			for _, tag := range stack.Tags {
-				switch *tag.Key {
+				switch aws.StringValue(tag.Key) {
 				case input.IgnoreTag:
 					ignore = true
 				case DeletionTag:
@@ -29,24 +34,28 @@ func (a *action) cleanCfStacks(ctx context.Context, input *CleanupScope) error {
 				continue
 			}
 
+			status := aws.StringValue(stack.StackStatus)
 			if !markedForDeletion {
-				if !a.canUpdateStack(aws.StringValue(stack.StackStatus)) {
-					LogDebug("cloudformation stack %s is in state %s and cannot be updated, skipping",
-						*stack.StackName, aws.StringValue(stack.StackStatus))
+				switch status {
+				case cf.StackStatusDeleteFailed,
+					cf.StackStatusRollbackComplete,
+					cf.StackStatusRollbackFailed,
+					cf.StackStatusUpdateRollbackFailed,
+					cf.StackStatusUpdateRollbackComplete:
+					LogWarning("cloudformation stack %s is in terminal/rollback state %s; will attempt deletion without tagging", *stack.StackName, status)
+				default:
+					// NOTE: only mark for future deletion if we're not running in dry-mode
+					if a.commit {
+						LogDebug("cloudformation stack %s does not have deletion tag, marking for future deletion and skipping cleanup", *stack.StackName)
+						if err := a.markCfStackForFutureDeletion(ctx, stack, client); err != nil {
+							LogError("failed to mark cloudformation stack %s for future deletion: %s", *stack.StackName, err.Error())
+						}
+					}
 					continue
 				}
-
-				// NOTE: only mark for future deletion if we're not running in dry-mode
-				if a.commit {
-					LogDebug("cloudformation stack %s does not have deletion tag, marking for future deletion and skipping cleanup", *stack.StackName)
-					if err := a.markCfStackForFutureDeletion(ctx, stack, client); err != nil {
-						LogError("failed to mark cloudformation stack %s for future deletion: %s", *stack.StackName, err.Error())
-					}
-				}
-				continue
 			}
 
-			switch aws.StringValue(stack.StackStatus) {
+			switch status {
 			case cf.ResourceStatusDeleteComplete,
 				cf.ResourceStatusDeleteInProgress:
 				LogDebug("cloudformation stack %s is already deleted/deleting, skipping cleanup", *stack.StackName)
@@ -93,6 +102,17 @@ func (a *action) markCfStackForFutureDeletion(ctx context.Context, stack *cf.Sta
 	stack.SetTags(append(stack.Tags, &cf.Tag{Key: aws.String(DeletionTag), Value: aws.String("true")}))
 
 	LogDebug("Updating tags for cloudformation stack %s", *stack.StackName)
+
+	status := aws.StringValue(stack.StackStatus)
+	switch status {
+	case cf.StackStatusDeleteFailed,
+		cf.StackStatusRollbackComplete,
+		cf.StackStatusRollbackFailed,
+		cf.StackStatusUpdateRollbackFailed,
+		cf.StackStatusUpdateRollbackComplete:
+		LogWarning("stack %s is in status %s; skipping tag update and relying on direct deletion", *stack.StackName, status)
+		return nil
+	}
 
 	if _, err := client.UpdateStackWithContext(ctx, &cf.UpdateStackInput{
 		Capabilities:        stack.Capabilities,
@@ -141,24 +161,4 @@ func (a *action) deleteCfStack(ctx context.Context, stackName string, client *cf
 	}
 
 	return nil
-}
-
-func (a *action) canUpdateStack(stackStatus string) bool {
-	nonUpdatableStates := []string{
-		cf.StackStatusCreateInProgress,
-		cf.StackStatusDeleteInProgress,
-		cf.StackStatusDeleteFailed,
-		cf.StackStatusDeleteComplete,
-		cf.StackStatusUpdateInProgress,
-		cf.StackStatusUpdateRollbackInProgress,
-		cf.StackStatusUpdateRollbackCompleteCleanupInProgress,
-		cf.StackStatusReviewInProgress,
-	}
-
-	for _, state := range nonUpdatableStates {
-		if stackStatus == state {
-			return false
-		}
-	}
-	return true
 }

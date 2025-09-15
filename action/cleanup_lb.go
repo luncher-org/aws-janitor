@@ -3,8 +3,10 @@ package action
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/elb"
 )
 
@@ -22,7 +24,7 @@ func (a *action) cleanLoadBalancers(ctx context.Context, input *CleanupScope) er
 			var ignore, markedForDeletion bool
 			for _, tagDescription := range tags.TagDescriptions {
 				for _, tag := range tagDescription.Tags {
-					switch *tag.Key {
+					switch aws.StringValue(tag.Key) {
 					case input.IgnoreTag:
 						ignore = true
 					case DeletionTag:
@@ -96,6 +98,22 @@ func (a *action) deleteLoadBalancer(ctx context.Context, lbName string, client *
 
 	if _, err := client.DeleteLoadBalancerWithContext(ctx, &elb.DeleteLoadBalancerInput{LoadBalancerName: &lbName}); err != nil {
 		return fmt.Errorf("failed to delete load balancer %s: %w", lbName, err)
+	}
+
+	if err := waitUntil(ctx, 5*time.Minute, 10*time.Second, func(ctx context.Context) (bool, error) {
+		out, err := client.DescribeLoadBalancersWithContext(ctx, &elb.DescribeLoadBalancersInput{LoadBalancerNames: []*string{&lbName}})
+		if err != nil {
+			if aerr, ok := err.(awserr.Error); ok {
+				if aerr.Code() == "AccessPointNotFound" {
+					return true, nil
+				}
+			}
+			LogWarning("error while waiting for ELB %s deletion: %s", lbName, err.Error())
+			return false, nil
+		}
+		return len(out.LoadBalancerDescriptions) == 0, nil
+	}); err != nil {
+		return fmt.Errorf("timeout waiting for classic ELB %s to be deleted", lbName)
 	}
 
 	return nil
