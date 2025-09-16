@@ -20,9 +20,10 @@ func (a *action) cleanSecurityGroups(ctx context.Context, input *CleanupScope) e
 			for _, sg := range sgPage.SecurityGroupForVpcs {
 				var ignore, markedForDeletion bool
 				for _, tag := range sg.Tags {
-					if *tag.Key == input.IgnoreTag {
+					switch aws.StringValue(tag.Key) {
+					case input.IgnoreTag:
 						ignore = true
-					} else if *tag.Key == DeletionTag {
+					case DeletionTag:
 						markedForDeletion = true
 					}
 				}
@@ -59,9 +60,9 @@ func (a *action) cleanSecurityGroups(ctx context.Context, input *CleanupScope) e
 		for _, vpc := range page.Vpcs {
 			var ignore bool
 			for _, tag := range vpc.Tags {
-				if *tag.Key == input.IgnoreTag {
+				switch aws.StringValue(tag.Key) {
+				case input.IgnoreTag:
 					ignore = true
-					break
 				}
 			}
 
@@ -110,12 +111,18 @@ func (a *action) cleanSecurityGroups(ctx context.Context, input *CleanupScope) e
 			continue
 		}
 
-		LogDebug("Sleeping for 10 seconds to allow AWS to catch up")
-		time.Sleep(10 * time.Second)
-
-		if err := a.deleteSecurityGroup(ctx, *securityGroup.GroupId, client); err != nil {
-			LogError("failed to delete security group %s: %s", *securityGroup.GroupId, err.Error())
-		}
+		_ = waitUntil(ctx, 2*time.Minute, 10*time.Second, func(ctx context.Context) (bool, error) {
+			if err := a.deleteSecurityGroup(ctx, *securityGroup.GroupId, client); err != nil {
+				LogWarning("attempt to delete security group %s failed: %s", *securityGroup.GroupId, err.Error())
+				// Refresh SG permissions in case rules changed between attempts
+				desc, dErr := client.DescribeSecurityGroupsWithContext(ctx, &ec2.DescribeSecurityGroupsInput{GroupIds: []*string{securityGroup.GroupId}})
+				if dErr == nil && len(desc.SecurityGroups) == 1 {
+					_ = a.deleteSecurityGroupRules(ctx, *securityGroup.GroupId, desc.SecurityGroups[0].IpPermissions, desc.SecurityGroups[0].IpPermissionsEgress, client)
+				}
+				return false, nil
+			}
+			return true, nil
+		})
 	}
 
 	return nil

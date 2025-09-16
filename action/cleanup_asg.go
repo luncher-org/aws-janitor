@@ -16,7 +16,7 @@ func (a *action) cleanASGs(ctx context.Context, input *CleanupScope) error {
 		for _, asg := range page.AutoScalingGroups {
 			var ignore, markedForDeletion bool
 			for _, tag := range asg.Tags {
-				switch *tag.Key {
+				switch aws.StringValue(tag.Key) {
 				case input.IgnoreTag:
 					ignore = true
 				case DeletionTag:
